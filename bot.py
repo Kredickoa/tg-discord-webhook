@@ -209,46 +209,74 @@ if BOT_TOKEN:
                 upsert=True
             )
 
+    async def get_stored_sha() -> str | None:
+        if db is not None:
+            doc = await db.settings.find_one({"_id": "last_github_sha"})
+            return doc["value"] if doc else None
+        return None
+
+    async def set_stored_sha(sha: str):
+        if db is not None:
+            await db.settings.update_one(
+                {"_id": "last_github_sha"},
+                {"$set": {"value": sha}},
+                upsert=True
+            )
+
     async def check_github() -> str | None:
         global github_last_sha
         url = "https://api.github.com/repos/Kredickoa/tg-discord-webhook/commits/main"
         async with httpx.AsyncClient() as c:
-            resp = await c.get(url, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                sha = data["sha"]
-                msg = data["commit"]["message"]
-                if github_last_sha is None:
-                    github_last_sha = sha
-                    return None
-                if sha != github_last_sha:
-                    github_last_sha = sha
-                    return msg
+            try:
+                resp = await c.get(url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    sha = data["sha"]
+                    msg = data["commit"]["message"]
+                    
+                    # 1. Sync in-memory with DB on first run
+                    if github_last_sha is None:
+                        github_last_sha = await get_stored_sha()
+                    
+                    # 2. Compare
+                    if github_last_sha is None:
+                        # First time ever or no DB
+                        github_last_sha = sha
+                        await set_stored_sha(sha)
+                        return None
+                    
+                    if sha != github_last_sha:
+                        github_last_sha = sha
+                        await set_stored_sha(sha)
+                        return msg
+            except Exception as e:
+                logger.error(f"GitHub check error: {e}")
         return None
 
     async def github_watcher():
         logger.info("GitHub watcher started.")
-        await asyncio.sleep(10)  # Initial wait for bot to settle
+        await asyncio.sleep(5)  # Short wait
         while True:
             try:
                 new_cmt = await check_github()
-                if new_cmt and db is not None:
+                if new_cmt:
                     logger.info(f"New GitHub commit detected: {new_cmt}")
-                    async for doc in db.settings.find({"value": True}):
-                        if str(doc["_id"]).startswith("gh_notify_"):
-                            uid = int(doc["_id"].replace("gh_notify_", ""))
-                            try:
-                                await bot_client.send_message(
-                                    uid,
-                                    f"⚠️ **Увага! Власник обновив код на GitHub!**\nКоміт: `{new_cmt}`\n\nМожете оновити бота на Railway."
-                                )
-                                logger.info(f"Notified {uid} about new commit.")
-                            except Exception as e:
-                                logger.error(f"Failed to notify {uid}: {e}")
+                    if db is not None:
+                        async for doc in db.settings.find({"value": True}):
+                            if str(doc["_id"]).startswith("gh_notify_"):
+                                uid = int(doc["_id"].replace("gh_notify_", ""))
+                                try:
+                                    await bot_client.send_message(
+                                        uid,
+                                        f"⚠️ **Увага! Власник обновив код на GitHub!**\nКоміт: `{new_cmt}`\n\nМожете оновити бота на Railway."
+                                    )
+                                    logger.info(f"Notified {uid} about new commit.")
+                                except Exception as e:
+                                    logger.error(f"Failed to notify {uid}: {e}")
             except Exception as e:
                 logger.error(f"Error in github_watcher: {e}")
             
-            await asyncio.sleep(600)  # Check every 10 mins
+            await asyncio.sleep(300)  # Reduced to 5 mins for better responsiveness
 
     @bot_client.on(events.NewMessage(pattern="/start"))
     async def admin_start(event):
