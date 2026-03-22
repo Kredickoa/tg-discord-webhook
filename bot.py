@@ -9,11 +9,16 @@ import io
 import json
 import logging
 import os
+import time
+import asyncio
 import collections
+import datetime
 
+import motor.motor_asyncio
 import httpx
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.tl.custom import Button
 from telethon.sessions import StringSession
 from telethon.tl.types import Message, MessageMediaPhoto, MessageMediaDocument, DocumentAttributeVideo
 
@@ -24,6 +29,9 @@ API_ID = os.environ.get("TELEGRAM_API_ID")
 API_HASH = os.environ.get("TELEGRAM_API_HASH")
 SESSION_STRING = os.environ.get("TELEGRAM_SESSION_STRING")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 
 # Channels to listen to (usernames without @)
 CHANNELS = ["ab3army", "ab3brigade"]
@@ -75,9 +83,10 @@ def _media_embed_video_ok(filename: str, size_mb: float) -> dict:
 
 
 def _media_embed_too_large(label: str, size_mb: float, msg_link: str) -> dict:
-    desc = f"⚠️ {label} ({size_mb:.1f} МБ) — перевищує ліміт Discord ({DISCORD_MAX_BYTES//1024//1024} МБ)."
     if msg_link:
-        desc += f"\n🔗 [**Відкрити в Telegram**]({msg_link})"
+        desc = f"🔗 **[{label} ({size_mb:.1f} МБ) — Відкрити в Telegram]({msg_link})**"
+    else:
+        desc = f"📎 **{label} ({size_mb:.1f} МБ)**"
     return _base_embed(description=desc)
 
 
@@ -165,6 +174,156 @@ def _escape_pings(text: str | None) -> str:
     return (text or "").replace("@", "＠")
 
 
+# ─── Stats & Admin Bot ──────────────────────────────────────────────────────────
+bot_client = None
+db = None
+
+if MONGO_URI:
+    mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+    db = mongo_client["telegram_forwarder"]
+
+async def _add_stat(ch_title: str, msg_type: str):
+    if db is not None:
+        await db.stats.insert_one({
+            "channel": ch_title,
+            "type": msg_type,
+            "time": datetime.datetime.now()
+        })
+
+if BOT_TOKEN:
+    bot_client = TelegramClient(StringSession(""), int(API_ID), API_HASH)
+    github_last_sha = None
+    LAST_GH_CHECK = 0
+
+    async def get_github_setting(user_id: int) -> bool:
+        if db is not None:
+            doc = await db.settings.find_one({"_id": f"gh_notify_{user_id}"})
+            return doc["value"] if doc else False
+        return False
+
+    async def set_github_setting(user_id: int, val: bool):
+        if db is not None:
+            await db.settings.update_one(
+                {"_id": f"gh_notify_{user_id}"},
+                {"$set": {"value": val}},
+                upsert=True
+            )
+
+    async def check_github() -> str | None:
+        global github_last_sha
+        url = "https://api.github.com/repos/Kredickoa/tg-discord-webhook/commits/main"
+        async with httpx.AsyncClient() as c:
+            resp = await c.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                sha = data["sha"]
+                msg = data["commit"]["message"]
+                if github_last_sha is None:
+                    github_last_sha = sha
+                    return None
+                if sha != github_last_sha:
+                    github_last_sha = sha
+                    return msg
+        return None
+
+    async def github_watcher():
+        while True:
+            await asyncio.sleep(600)  # Check every 10 mins
+            new_cmt = await check_github()
+            if new_cmt and db is not None:
+                async for doc in db.settings.find({"value": True}):
+                    if str(doc["_id"]).startswith("gh_notify_"):
+                        uid = int(doc["_id"].replace("gh_notify_", ""))
+                        try:
+                            await bot_client.send_message(
+                                uid,
+                                f"⚠️ **Увага! Власник обновив код на GitHub!**\nКоміт: `{new_cmt}`\n\nМожете оновити бота на Railway."
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to notify {uid}: {e}")
+
+    @bot_client.on(events.NewMessage(pattern="/start"))
+    async def admin_start(event):
+        btn = [
+            [Button.inline("📊 Статистика (Mongo)", b"stats")],
+            [Button.inline("📁 Перевірити GitHub", b"github")],
+            [Button.inline("⚙️ Налаштування GitHub Alerts", b"gh_settings")]
+        ]
+        await event.respond("Привіт! Панель керування активна.", buttons=btn)
+
+    @bot_client.on(events.CallbackQuery())
+    async def admin_callback(event):
+        global LAST_GH_CHECK
+        user_id = event.sender_id
+        if event.data == b"stats":
+            if db is None:
+                await event.answer("MongoDB не підключена!", alert=True)
+                return
+            recent = await db.stats.find().sort("time", -1).limit(15).to_list(length=15)
+            if not recent:
+                await event.answer("Статистика порожня.", alert=True)
+                return
+            lines = [f"🕐 {r['time'].strftime('%H:%M')} | {r['channel']} ➔ {r['type']}" for r in recent]
+            txt = "**Останні 15 пересилань:**\n" + "\n".join(lines)
+            await event.edit(txt, buttons=[[Button.inline("Назад", b"back")]])
+            
+        elif event.data == b"github":
+            now = time.time()
+            if now - LAST_GH_CHECK < 60:
+                await event.answer("Зачекайте. Кулдаун 1 хв.", alert=True)
+                return
+            LAST_GH_CHECK = now
+            await event.answer("Перевіряю GitHub...")
+            url = "https://api.github.com/repos/Kredickoa/tg-discord-webhook/commits/main"
+            async with httpx.AsyncClient() as c:
+                resp = await c.get(url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    msg = data["commit"]["message"]
+                    date = data["commit"]["author"]["date"]
+                    txt = f"**Останній коміт на GitHub:**\n`{msg}`\n📅 {date}"
+                    await event.edit(txt, buttons=[[Button.inline("Назад", b"back")]])
+                else:
+                    await event.answer("Помилка API GitHub", alert=True)
+
+        elif event.data == b"gh_settings":
+            wants_notify = await get_github_setting(user_id)
+            state = "🟢 УВІМКНЕНІ" if wants_notify else "🔴 ВИМКНЕНІ"
+            txt = f"**Сповіщення про нові коміти GitHub**\nЗараз: {state}"
+            btn = [
+                [Button.inline("Увімкнути", b"gh_on"), Button.inline("Вимкнути", b"gh_off")],
+                [Button.inline("Назад", b"back")]
+            ]
+            await event.edit(txt, buttons=btn)
+
+        elif event.data == b"gh_on":
+            await set_github_setting(user_id, True)
+            await event.answer("Сповіщення увімкнено!", alert=True)
+            txt = "**Сповіщення про нові коміти GitHub**\nЗараз: 🟢 УВІМКНЕНІ"
+            btn = [
+                [Button.inline("Увімкнути", b"gh_on"), Button.inline("Вимкнути", b"gh_off")],
+                [Button.inline("Назад", b"back")]
+            ]
+            await event.edit(txt, buttons=btn)
+
+        elif event.data == b"gh_off":
+            await set_github_setting(user_id, False)
+            await event.answer("Сповіщення вимкнено!", alert=True)
+            txt = "**Сповіщення про нові коміти GitHub**\nЗараз: 🔴 ВИМКНЕНІ"
+            btn = [
+                [Button.inline("Увімкнути", b"gh_on"), Button.inline("Вимкнути", b"gh_off")],
+                [Button.inline("Назад", b"back")]
+            ]
+            await event.edit(txt, buttons=btn)
+
+        elif event.data == b"back":
+            btn = [
+                [Button.inline("📊 Статистика (Mongo)", b"stats")],
+                [Button.inline("📁 Перевірити GitHub", b"github")],
+                [Button.inline("⚙️ Налаштування GitHub Alerts", b"gh_settings")]
+            ]
+            await event.edit("Панель керування:", buttons=btn)
+
 # ─── Main handler ─────────────────────────────────────────────────────────────
 client = TelegramClient(StringSession(SESSION_STRING), int(API_ID), API_HASH)
 
@@ -189,6 +348,7 @@ async def on_channel_post(event: events.NewMessage.Event):
     if msg.text and not msg.media:
         embed = _text_embed(raw_text, ch_title)
         embed["author"] = _author_embed_part(ch_title)
+        await _add_stat(ch_title, "Текст")
         await _send([embed], username=ch_title)
         return
 
@@ -227,6 +387,7 @@ async def on_channel_post(event: events.NewMessage.Event):
 
         # Build embeds
         if not file_data:
+            await _add_stat(ch_title, f"Медіа (>100мб)")
             media_e = _media_embed_too_large(f"Файл «{filename}»" if not is_video else "Відео", size_mb, msg_link)
             media_e["author"] = _author_embed_part(ch_title)
             await _send([media_e] + text_embed(), username=ch_title)
@@ -234,28 +395,42 @@ async def on_channel_post(event: events.NewMessage.Event):
 
         # It's an image
         if filename.endswith(('jpg', 'jpeg', 'png', 'webp')) and not is_video:
+            await _add_stat(ch_title, f"Фото ({round(size_mb, 1)}мб)")
             media_e = _media_embed_image(filename)
             media_e["author"] = _author_embed_part(ch_title)
             await _send([media_e] + text_embed(), username=ch_title, file_data=file_data, filename=filename)
         # It's a video
         elif is_video:
+            await _add_stat(ch_title, f"Відео ({round(size_mb, 1)}мб)")
             media_e = _media_embed_video_ok(filename, size_mb)
             media_e["author"] = _author_embed_part(ch_title)
             await _send([media_e] + text_embed(), username=ch_title, file_data=file_data, filename=filename)
         # Other documents/audio
         else:
+            await _add_stat(ch_title, f"Файл ({round(size_mb, 1)}мб)")
             media_e = _base_embed(description=f"📎 Файл: `{filename}` ({size_mb:.1f} МБ)")
             media_e["author"] = _author_embed_part(ch_title)
             await _send([media_e] + text_embed(), username=ch_title, file_data=file_data, filename=filename)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
-def main() -> None:
-    logger.info("🚀 MTProto Bot starting... connecting to Telegram")
-    client.start()
-    logger.info(f"✅ Успішно! Прослуховування каналів: {CHANNELS}")
-    client.run_until_disconnected()
-
+async def main() -> None:
+    logger.info("Initializing Telethon clients...")
+    await client.start()
+    
+    if bot_client:
+        await bot_client.start(bot_token=BOT_TOKEN)
+        bot_client.loop.create_task(github_watcher())
+        
+    logger.info("✅ Успішно! Прослуховування каналів: %s", CHANNELS)
+    
+    if bot_client:
+        await asyncio.gather(
+            client.run_until_disconnected(),
+            bot_client.run_until_disconnected()
+        )
+    else:
+        await client.run_until_disconnected()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
