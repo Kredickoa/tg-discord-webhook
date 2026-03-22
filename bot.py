@@ -32,6 +32,9 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "Kredickoa/tg-discord-webhook").strip()
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
+GITHUB_POLL_INTERVAL_SECONDS = int(os.environ.get("GITHUB_POLL_INTERVAL_SECONDS", "300"))
 
 # Channels to listen to (usernames without @)
 CHANNELS = ["ab3army", "ab3brigade"]
@@ -136,6 +139,17 @@ def _guess_mime(filename: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
+def _github_commit_api_url() -> str:
+    return f"https://api.github.com/repos/{GITHUB_REPO}/commits"
+
+
+def _github_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "tg-discord-webhook-bot",
+    }
+
+
 # ─── Deduplication ────────────────────────────────────────────────────────────
 def _is_duplicate(msg: Message) -> bool:
     """Returns True if this message is a duplicate of a recently sent one."""
@@ -223,6 +237,58 @@ if BOT_TOKEN:
                 upsert=True
             )
 
+    async def _fetch_github_commits(limit: int = 10) -> list[dict]:
+        params = {"sha": GITHUB_BRANCH, "per_page": limit}
+        async with httpx.AsyncClient(timeout=15) as c:
+            resp = await c.get(_github_commit_api_url(), params=params, headers=_github_headers())
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, list) else []
+
+    async def check_github_commits() -> list[dict]:
+        global github_last_sha
+        try:
+            commits = await _fetch_github_commits()
+        except Exception as e:
+            logger.error("GitHub check error for %s@%s: %s", GITHUB_REPO, GITHUB_BRANCH, e)
+            return []
+
+        if not commits:
+            logger.warning("GitHub check returned no commits for %s@%s", GITHUB_REPO, GITHUB_BRANCH)
+            return []
+
+        latest_sha = commits[0]["sha"]
+
+        if github_last_sha is None:
+            github_last_sha = await get_stored_sha()
+
+        if github_last_sha is None:
+            github_last_sha = latest_sha
+            await set_stored_sha(latest_sha)
+            logger.info("GitHub watcher baseline initialized at %s for %s@%s", latest_sha[:7], GITHUB_REPO, GITHUB_BRANCH)
+            return []
+
+        if latest_sha == github_last_sha:
+            return []
+
+        new_commits: list[dict] = []
+        for commit in commits:
+            if commit["sha"] == github_last_sha:
+                break
+            new_commits.append(commit)
+        else:
+            logger.warning(
+                "Stored SHA %s not found in latest %s commits for %s@%s; notifying only fetched history",
+                github_last_sha[:7],
+                len(commits),
+                GITHUB_REPO,
+                GITHUB_BRANCH,
+            )
+
+        github_last_sha = latest_sha
+        await set_stored_sha(latest_sha)
+        return list(reversed(new_commits))
+
     async def check_github() -> str | None:
         global github_last_sha
         url = "https://api.github.com/repos/Kredickoa/tg-discord-webhook/commits/main"
@@ -254,10 +320,43 @@ if BOT_TOKEN:
         return None
 
     async def github_watcher():
-        logger.info("GitHub watcher started.")
+        logger.info("GitHub watcher started for %s@%s.", GITHUB_REPO, GITHUB_BRANCH)
         await asyncio.sleep(5)  # Short wait
         while True:
             try:
+                new_commits = await check_github_commits()
+                if new_commits and db is not None:
+                    logger.info("Detected %s new GitHub commit(s) for %s@%s.", len(new_commits), GITHUB_REPO, GITHUB_BRANCH)
+                    subscribers = []
+                    async for doc in db.settings.find({"value": True}):
+                        if str(doc["_id"]).startswith("gh_notify_"):
+                            subscribers.append(int(doc["_id"].replace("gh_notify_", "")))
+
+                    if not subscribers:
+                        logger.info("No GitHub alert subscribers enabled in MongoDB.")
+
+                    for commit in new_commits:
+                        commit_msg = commit["commit"]["message"]
+                        commit_sha = commit["sha"][:7]
+                        commit_url = commit.get("html_url", "")
+                        notify_text = (
+                            f"вљ пёЏ **РЈРІР°РіР°! Р’Р»Р°СЃРЅРёРє РѕР±РЅРѕРІРёРІ РєРѕРґ РЅР° GitHub!**\n"
+                            f"Р РµРїРѕР·РёС‚РѕСЂС–Р№: `{GITHUB_REPO}`\n"
+                            f"Р“С–Р»РєР°: `{GITHUB_BRANCH}`\n"
+                            f"SHA: `{commit_sha}`\n"
+                            f"РљРѕРјС–С‚: `{commit_msg}`"
+                        )
+                        if commit_url:
+                            notify_text += f"\n{commit_url}"
+
+                        for uid in subscribers:
+                            try:
+                                await bot_client.send_message(uid, notify_text)
+                                logger.info("Notified %s about commit %s.", uid, commit_sha)
+                            except Exception as e:
+                                logger.error("Failed to notify %s about commit %s: %s", uid, commit_sha, e)
+                await asyncio.sleep(GITHUB_POLL_INTERVAL_SECONDS)
+                continue
                 new_cmt = await check_github()
                 if new_cmt:
                     logger.info(f"New GitHub commit detected: {new_cmt}")
@@ -276,7 +375,7 @@ if BOT_TOKEN:
             except Exception as e:
                 logger.error(f"Error in github_watcher: {e}")
             
-            await asyncio.sleep(300)  # Reduced to 5 mins for better responsiveness
+            await asyncio.sleep(GITHUB_POLL_INTERVAL_SECONDS)
 
     @bot_client.on(events.NewMessage(pattern="/start"))
     async def admin_start(event):
