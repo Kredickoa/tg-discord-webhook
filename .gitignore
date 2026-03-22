@@ -1,0 +1,9 @@
+# Environments
+.env
+
+# Telethon session files
+*.session
+
+# Python
+__pycache__/
+*.pyc
