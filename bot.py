@@ -349,6 +349,15 @@ if BOT_TOKEN:
                         if commit_url:
                             notify_text += f"\n{commit_url}"
 
+                        notify_text = (
+                            "GitHub update detected\n"
+                            f"Repo: `{GITHUB_REPO}`\n"
+                            f"Branch: `{GITHUB_BRANCH}`\n"
+                            f"SHA: `{commit_sha}`\n"
+                            f"Commit: `{commit_msg}`"
+                            + (f"\n{commit_url}" if commit_url else "")
+                        )
+
                         for uid in subscribers:
                             try:
                                 await bot_client.send_message(uid, notify_text)
