@@ -227,20 +227,28 @@ if BOT_TOKEN:
         return None
 
     async def github_watcher():
+        logger.info("GitHub watcher started.")
+        await asyncio.sleep(10)  # Initial wait for bot to settle
         while True:
+            try:
+                new_cmt = await check_github()
+                if new_cmt and db is not None:
+                    logger.info(f"New GitHub commit detected: {new_cmt}")
+                    async for doc in db.settings.find({"value": True}):
+                        if str(doc["_id"]).startswith("gh_notify_"):
+                            uid = int(doc["_id"].replace("gh_notify_", ""))
+                            try:
+                                await bot_client.send_message(
+                                    uid,
+                                    f"⚠️ **Увага! Власник обновив код на GitHub!**\nКоміт: `{new_cmt}`\n\nМожете оновити бота на Railway."
+                                )
+                                logger.info(f"Notified {uid} about new commit.")
+                            except Exception as e:
+                                logger.error(f"Failed to notify {uid}: {e}")
+            except Exception as e:
+                logger.error(f"Error in github_watcher: {e}")
+            
             await asyncio.sleep(600)  # Check every 10 mins
-            new_cmt = await check_github()
-            if new_cmt and db is not None:
-                async for doc in db.settings.find({"value": True}):
-                    if str(doc["_id"]).startswith("gh_notify_"):
-                        uid = int(doc["_id"].replace("gh_notify_", ""))
-                        try:
-                            await bot_client.send_message(
-                                uid,
-                                f"⚠️ **Увага! Власник обновив код на GitHub!**\nКоміт: `{new_cmt}`\n\nМожете оновити бота на Railway."
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to notify {uid}: {e}")
 
     @bot_client.on(events.NewMessage(pattern="/start"))
     async def admin_start(event):
@@ -297,6 +305,10 @@ if BOT_TOKEN:
             await event.edit(txt, buttons=btn)
 
         elif event.data == b"gh_on":
+            was_notify = await get_github_setting(user_id)
+            if was_notify:
+                await event.answer("Сповіщення вже увімкнені!", alert=True)
+                return
             await set_github_setting(user_id, True)
             await event.answer("Сповіщення увімкнено!", alert=True)
             txt = "**Сповіщення про нові коміти GitHub**\nЗараз: 🟢 УВІМКНЕНІ"
@@ -307,6 +319,10 @@ if BOT_TOKEN:
             await event.edit(txt, buttons=btn)
 
         elif event.data == b"gh_off":
+            was_notify = await get_github_setting(user_id)
+            if not was_notify:
+                await event.answer("Сповіщення вже вимкнені!", alert=True)
+                return
             await set_github_setting(user_id, False)
             await event.answer("Сповіщення вимкнено!", alert=True)
             txt = "**Сповіщення про нові коміти GitHub**\nЗараз: 🔴 ВИМКНЕНІ"
