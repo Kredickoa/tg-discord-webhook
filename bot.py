@@ -38,6 +38,8 @@ GITHUB_POLL_INTERVAL_SECONDS = int(os.environ.get("GITHUB_POLL_INTERVAL_SECONDS"
 
 # Channels to listen to (usernames without @)
 CHANNELS = ["ab3army", "ab3brigade"]
+CHANNEL_USERNAMES = {channel.lower() for channel in CHANNELS}
+CHANNEL_IDS: set[int] = set()
 
 # Constants
 EMBED_COLOR = 0xFF6600
@@ -128,6 +130,8 @@ async def _send(
 
     if resp.status_code not in (200, 204):
         logger.error("Discord error %s: %s", resp.status_code, resp.text[:400])
+    else:
+        logger.info("Discord webhook delivered successfully with status %s.", resp.status_code)
 
 
 def _guess_mime(filename: str) -> str:
@@ -186,6 +190,19 @@ def _is_duplicate(msg: Message) -> bool:
 
 def _escape_pings(text: str | None) -> str:
     return (text or "").replace("@", "＠")
+
+
+def _is_target_channel_event(event: events.NewMessage.Event) -> bool:
+    chat = event.chat
+    username = getattr(chat, "username", None)
+    if username and username.lower() in CHANNEL_USERNAMES:
+        return True
+
+    chat_id = getattr(chat, "id", None)
+    if isinstance(chat_id, int) and chat_id in CHANNEL_IDS:
+        return True
+
+    return False
 
 
 # ─── Stats & Admin Bot ──────────────────────────────────────────────────────────
@@ -479,9 +496,19 @@ if BOT_TOKEN:
 # ─── Main handler ─────────────────────────────────────────────────────────────
 client = TelegramClient(StringSession(SESSION_STRING), int(API_ID), API_HASH)
 
-@client.on(events.NewMessage(chats=CHANNELS))
+@client.on(events.NewMessage())
 async def on_channel_post(event: events.NewMessage.Event):
+    if not _is_target_channel_event(event):
+        return
+
     msg: Message = event.message
+    logger.info(
+        "Target channel post received: chat_id=%s username=%s message_id=%s media=%s",
+        getattr(event.chat, "id", None),
+        getattr(event.chat, "username", None),
+        getattr(msg, "id", None),
+        bool(msg.media),
+    )
     
     # 1. Deduplication Check
     if _is_duplicate(msg):
@@ -569,6 +596,21 @@ async def on_channel_post(event: events.NewMessage.Event):
 async def main() -> None:
     logger.info("Initializing Telethon clients...")
     await client.start()
+    CHANNEL_IDS.clear()
+    for channel_name in CHANNELS:
+        try:
+            entity = await client.get_entity(channel_name)
+            entity_id = getattr(entity, "id", None)
+            if isinstance(entity_id, int):
+                CHANNEL_IDS.add(entity_id)
+            logger.info(
+                "Resolved channel target: username=%s id=%s title=%s",
+                channel_name,
+                entity_id,
+                getattr(entity, "title", None),
+            )
+        except Exception as e:
+            logger.error("Failed to resolve channel %s: %s", channel_name, e)
     
     if bot_client:
         await bot_client.start(bot_token=BOT_TOKEN)
