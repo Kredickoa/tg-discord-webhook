@@ -50,6 +50,10 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
+logging.getLogger("telethon.network").setLevel(logging.WARNING)
 
 # LRU Cache for deduplication (keeps last 50 message signatures)
 sent_cache: collections.deque = collections.deque(maxlen=50)
@@ -107,7 +111,7 @@ async def _send(
     username: str,
     file_data: bytes | None = None,
     filename: str | None = None,
-) -> None:
+) -> bool:
     """POST to Discord webhook. Dynamically sets webhook username."""
     # Webhook identity overrides
     payload = {
@@ -130,8 +134,16 @@ async def _send(
 
     if resp.status_code not in (200, 204):
         logger.error("Discord error %s: %s", resp.status_code, resp.text[:400])
-    else:
-        logger.info("Discord webhook delivered successfully with status %s.", resp.status_code)
+        return False
+
+    logger.info(
+        "discord_send_ok username=%s embeds=%s file=%s status=%s",
+        username,
+        len(embeds),
+        bool(file_data and filename),
+        resp.status_code,
+    )
+    return True
 
 
 def _guess_mime(filename: str) -> str:
@@ -186,6 +198,11 @@ def _is_duplicate(msg: Message) -> bool:
         
     sent_cache.append(sig)
     return False
+
+
+async def _record_delivery_stat(ch_title: str, msg_type: str, delivered: bool) -> None:
+    if delivered:
+        await _add_stat(ch_title, msg_type)
 
 
 def _escape_pings(text: str | None) -> str:
@@ -503,11 +520,12 @@ async def on_channel_post(event: events.NewMessage.Event):
 
     msg: Message = event.message
     logger.info(
-        "Target channel post received: chat_id=%s username=%s message_id=%s media=%s",
+        "target_post_received chat_id=%s username=%s message_id=%s media=%s text=%s",
         getattr(event.chat, "id", None),
         getattr(event.chat, "username", None),
         getattr(msg, "id", None),
         bool(msg.media),
+        bool(msg.text),
     )
     
     # 1. Deduplication Check
@@ -527,8 +545,8 @@ async def on_channel_post(event: events.NewMessage.Event):
     if msg.text and not msg.media:
         embed = _text_embed(raw_text, ch_title)
         embed["author"] = _author_embed_part(ch_title)
-        await _add_stat(ch_title, "Текст")
-        await _send([embed], username=ch_title)
+        delivered = await _send([embed], username=ch_title)
+        await _record_delivery_stat(ch_title, "Текст", delivered)
         return
 
     # ── Media Processing ──────────────────────────────────────────────────────
@@ -566,30 +584,28 @@ async def on_channel_post(event: events.NewMessage.Event):
 
         # Build embeds
         if not file_data:
-            await _add_stat(ch_title, f"Медіа (>100мб)")
             media_e = _media_embed_too_large(f"Файл «{filename}»" if not is_video else "Відео", size_mb, msg_link)
             media_e["author"] = _author_embed_part(ch_title)
-            await _send([media_e] + text_embed(), username=ch_title)
+            delivered = await _send([media_e] + text_embed(), username=ch_title)
+            await _record_delivery_stat(ch_title, "Медіа (>100мб)", delivered)
             return
 
         # It's an image
         if filename.endswith(('jpg', 'jpeg', 'png', 'webp')) and not is_video:
-            await _add_stat(ch_title, f"Фото ({round(size_mb, 1)}мб)")
             media_e = _media_embed_image(filename)
             media_e["author"] = _author_embed_part(ch_title)
-            await _send([media_e] + text_embed(), username=ch_title, file_data=file_data, filename=filename)
+            delivered = await _send([media_e] + text_embed(), username=ch_title, file_data=file_data, filename=filename)
+            await _record_delivery_stat(ch_title, "Фото", delivered)
         # It's a video
         elif is_video:
-            await _add_stat(ch_title, f"Відео ({round(size_mb, 1)}мб)")
-            media_e = _media_embed_video_ok(filename, size_mb)
-            media_e["author"] = _author_embed_part(ch_title)
-            await _send([media_e] + text_embed(), username=ch_title, file_data=file_data, filename=filename)
+            delivered = await _send(text_embed(), username=ch_title, file_data=file_data, filename=filename)
+            await _record_delivery_stat(ch_title, "Відео", delivered)
         # Other documents/audio
         else:
-            await _add_stat(ch_title, f"Файл ({round(size_mb, 1)}мб)")
             media_e = _base_embed(description=f"📎 Файл: `{filename}` ({size_mb:.1f} МБ)")
             media_e["author"] = _author_embed_part(ch_title)
-            await _send([media_e] + text_embed(), username=ch_title, file_data=file_data, filename=filename)
+            delivered = await _send([media_e] + text_embed(), username=ch_title, file_data=file_data, filename=filename)
+            await _record_delivery_stat(ch_title, "Файл", delivered)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
