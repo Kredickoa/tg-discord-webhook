@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telethon.client.updates").setLevel(logging.WARNING)
+logging.getLogger("telethon.client.downloads").setLevel(logging.WARNING)
 logging.getLogger("telethon.network").setLevel(logging.WARNING)
 
 # LRU Cache for deduplication (keeps last 50 message signatures)
@@ -175,6 +176,11 @@ def _is_duplicate(msg: Message) -> bool:
     if msg.fwd_from and msg.fwd_from.from_id and msg.fwd_from.channel_post:
         # e.g., "fwd:PeerChannel(channel_id=123):456"
         sig = f"fwd:{msg.fwd_from.from_id}:{msg.fwd_from.channel_post}"
+        logger.info(
+            "forward_signature_detected signature=%s grouped_id=%s",
+            sig,
+            getattr(msg, "grouped_id", None),
+        )
     
     # 2. Exact text + media check
     elif msg.text or msg.media:
@@ -193,7 +199,12 @@ def _is_duplicate(msg: Message) -> bool:
         return False
 
     if sig in sent_cache:
-        logger.info(f"⏭️ Пропущено дублікат: {sig}")
+        logger.info(
+            "duplicate_skipped signature=%s message_id=%s grouped_id=%s",
+            sig,
+            getattr(msg, "id", None),
+            getattr(msg, "grouped_id", None),
+        )
         return True
         
     sent_cache.append(sig)
@@ -210,7 +221,10 @@ def _escape_pings(text: str | None) -> str:
 
 
 def _is_target_channel_event(event: events.NewMessage.Event) -> bool:
-    chat = event.chat
+    return _is_target_chat(event.chat)
+
+
+def _is_target_chat(chat) -> bool:
     username = getattr(chat, "username", None)
     if username and username.lower() in CHANNEL_USERNAMES:
         return True
@@ -513,10 +527,119 @@ if BOT_TOKEN:
 # ─── Main handler ─────────────────────────────────────────────────────────────
 client = TelegramClient(StringSession(SESSION_STRING), int(API_ID), API_HASH)
 
+
+async def _process_target_message(chat, msg: Message, source: str) -> None:
+    logger.info(
+        "target_message_received source=%s chat_id=%s username=%s message_id=%s media=%s text=%s grouped_id=%s",
+        source,
+        getattr(chat, "id", None),
+        getattr(chat, "username", None),
+        getattr(msg, "id", None),
+        bool(msg.media),
+        bool(msg.text),
+        getattr(msg, "grouped_id", None),
+    )
+
+    if _is_duplicate(msg):
+        return
+
+    ch_title = chat.title if chat else "Telegram Channel"
+    msg_link = f"https://t.me/{chat.username}/{msg.id}" if getattr(chat, "username", None) else ""
+    raw_text = _escape_pings(msg.text)
+
+    def text_embed() -> list[dict]:
+        if not raw_text:
+            return []
+        return [_text_embed(raw_text, ch_title)]
+
+    if msg.text and not msg.media:
+        embed = _text_embed(raw_text, ch_title)
+        delivered = await _send([embed], username=ch_title)
+        await _record_delivery_stat(ch_title, "Текст", delivered)
+        return
+
+    if not msg.media:
+        logger.info(
+            "target_message_skipped chat_id=%s message_id=%s reason=no_media_no_text",
+            getattr(chat, "id", None),
+            getattr(msg, "id", None),
+        )
+        return
+
+    size = 0
+    is_video = False
+    filename = "file"
+
+    if isinstance(msg.media, MessageMediaDocument):
+        size = msg.media.document.size
+        for attr in msg.media.document.attributes:
+            if hasattr(attr, "file_name"):
+                filename = attr.file_name
+            if isinstance(attr, DocumentAttributeVideo):
+                is_video = True
+                if filename == "file":
+                    filename = "video.mp4"
+    elif isinstance(msg.media, MessageMediaPhoto):
+        size = max(s.size for s in msg.media.photo.sizes if hasattr(s, "size"))
+        filename = "photo.jpg"
+
+    size_mb = size / 1024 / 1024
+    file_data = None
+    if size <= DISCORD_MAX_BYTES:
+        logger.info(
+            "media_download_start chat_id=%s message_id=%s size_mb=%.1f filename=%s",
+            getattr(chat, "id", None),
+            getattr(msg, "id", None),
+            size_mb,
+            filename,
+        )
+        buf = io.BytesIO()
+        await client.download_media(msg, buf)
+        buf.seek(0)
+        file_data = buf.read()
+
+    if not file_data:
+        media_e = _media_embed_too_large(f"Файл «{filename}»" if not is_video else "Відео", size_mb, msg_link)
+        delivered = await _send([media_e] + text_embed(), username=ch_title)
+        await _record_delivery_stat(ch_title, "Медіа (>100мб)", delivered)
+        return
+
+    if filename.endswith(("jpg", "jpeg", "png", "webp")) and not is_video:
+        delivered = await _send(text_embed(), username=ch_title, file_data=file_data, filename=filename)
+        await _record_delivery_stat(ch_title, "Фото", delivered)
+        return
+
+    if is_video:
+        delivered = await _send(text_embed(), username=ch_title, file_data=file_data, filename=filename)
+        await _record_delivery_stat(ch_title, "Відео", delivered)
+        return
+
+    media_e = _base_embed(description=f"File: `{filename}` ({size_mb:.1f} MB)")
+    delivered = await _send([media_e] + text_embed(), username=ch_title, file_data=file_data, filename=filename)
+    await _record_delivery_stat(ch_title, "Файл", delivered)
+
+@client.on(events.Album())
+async def on_channel_album(event: events.Album.Event):
+    if not _is_target_chat(event.chat):
+        return
+    if not event.messages:
+        return
+    logger.info(
+        "target_album_received chat_id=%s username=%s items=%s grouped_id=%s",
+        getattr(event.chat, "id", None),
+        getattr(event.chat, "username", None),
+        len(event.messages),
+        getattr(event.messages[0], "grouped_id", None),
+    )
+    await _process_target_message(event.chat, event.messages[0], "album")
+
+
 @client.on(events.NewMessage())
 async def on_channel_post(event: events.NewMessage.Event):
     if not _is_target_channel_event(event):
         return
+    await _process_target_message(event.chat, event.message, "new_message")
+    return
 
     msg: Message = event.message
     logger.info(
