@@ -40,6 +40,7 @@ MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "Kredickoa/tg-discord-webhook").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 GITHUB_POLL_INTERVAL_SECONDS = int(os.environ.get("GITHUB_POLL_INTERVAL_SECONDS", "300"))
+HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "300"))
 
 CHANNELS = ["ab3army", "ab3brigade"]
 CHANNEL_USERNAMES = {channel.lower() for channel in CHANNELS}
@@ -81,6 +82,13 @@ db = None
 if MONGO_URI:
     mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
     db = mongo_client["telegram_forwarder"]
+
+started_at = time.monotonic()
+last_target_event_at: float | None = None
+last_discord_send_at: float | None = None
+last_discord_failure_at: float | None = None
+last_github_poll_at: float | None = None
+last_github_notify_at: float | None = None
 
 
 def _base_embed(title: str | None = None, description: str | None = None) -> dict[str, Any]:
@@ -129,6 +137,16 @@ def _chunk_attachments(attachments: list[DiscordAttachment]) -> list[list[Discor
         attachments[index:index + DISCORD_MAX_ATTACHMENTS]
         for index in range(0, len(attachments), DISCORD_MAX_ATTACHMENTS)
     ]
+
+
+def _mark_activity(name: str) -> None:
+    globals()[name] = time.monotonic()
+
+
+def _age_seconds(moment: float | None) -> str:
+    if moment is None:
+        return "never"
+    return str(int(time.monotonic() - moment))
 
 
 def _github_commit_api_url() -> str:
@@ -272,6 +290,7 @@ async def _post_discord(
                 response = await client.post(DISCORD_WEBHOOK_URL, json=payload)
 
             if response.status_code in (200, 204):
+                _mark_activity("last_discord_send_at")
                 logger.info(
                     "discord_send_ok username=%s embeds=%s attachments=%s status=%s",
                     username,
@@ -296,6 +315,7 @@ async def _post_discord(
                 await asyncio.sleep(retry_after)
                 continue
 
+            _mark_activity("last_discord_failure_at")
             logger.error(
                 "discord_send_failed username=%s status=%s body=%s",
                 username,
@@ -304,6 +324,7 @@ async def _post_discord(
             )
             return False
 
+    _mark_activity("last_discord_failure_at")
     logger.error(
         "discord_send_failed username=%s status=429 body=retry_limit_exceeded",
         username,
@@ -393,6 +414,7 @@ async def _process_target_messages(chat, messages: list[Message], source: str) -
         return
 
     primary = messages[0]
+    _mark_activity("last_target_event_at")
     logger.info(
         "target_message_received source=%s chat_id=%s username=%s message_id=%s media=%s text=%s grouped_id=%s items=%s",
         source,
@@ -496,6 +518,7 @@ if BOT_TOKEN:
     async def check_github_commits() -> list[dict[str, Any]]:
         global github_last_sha
         try:
+            _mark_activity("last_github_poll_at")
             commits = await _fetch_github_commits()
         except Exception as exc:
             logger.error("github_check_failed repo=%s branch=%s error=%s", GITHUB_REPO, GITHUB_BRANCH, exc)
@@ -569,6 +592,7 @@ if BOT_TOKEN:
                         for user_id in subscribers:
                             try:
                                 await bot_client.send_message(user_id, notify_text)
+                                _mark_activity("last_github_notify_at")
                                 logger.info("github_notify_ok user_id=%s sha=%s", user_id, commit_sha)
                             except Exception as exc:
                                 logger.error("github_notify_failed user_id=%s sha=%s error=%s", user_id, commit_sha, exc)
@@ -664,12 +688,35 @@ if BOT_TOKEN:
 client = TelegramClient(StringSession(SESSION_STRING), int(API_ID), API_HASH)
 
 
+async def heartbeat_monitor() -> None:
+    while True:
+        client_connected = client.is_connected()
+        bot_connected = bot_client.is_connected() if BOT_TOKEN else None
+        logger.info(
+            "heartbeat uptime_s=%s client_connected=%s bot_connected=%s last_target_event_age_s=%s last_discord_send_age_s=%s last_discord_failure_age_s=%s last_github_poll_age_s=%s last_github_notify_age_s=%s",
+            int(time.monotonic() - started_at),
+            client_connected,
+            bot_connected,
+            _age_seconds(last_target_event_at),
+            _age_seconds(last_discord_send_at),
+            _age_seconds(last_discord_failure_at),
+            _age_seconds(last_github_poll_at),
+            _age_seconds(last_github_notify_at),
+        )
+        if not client_connected:
+            logger.warning("heartbeat_client_disconnected")
+        if BOT_TOKEN and bot_connected is False:
+            logger.warning("heartbeat_bot_client_disconnected")
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+
 @client.on(events.Album())
 async def on_channel_album(event: events.Album.Event) -> None:
     if not _is_target_chat(event.chat):
         return
     if not event.messages:
         return
+    _mark_activity("last_target_event_at")
     logger.info(
         "target_album_received chat_id=%s username=%s items=%s grouped_id=%s",
         getattr(event.chat, "id", None),
@@ -685,6 +732,7 @@ async def on_channel_post(event: events.NewMessage.Event) -> None:
     if not _is_target_chat(event.chat):
         return
     if getattr(event.message, "grouped_id", None) is not None:
+        _mark_activity("last_target_event_at")
         logger.info(
             "grouped_message_buffered chat_id=%s username=%s message_id=%s grouped_id=%s",
             getattr(event.chat, "id", None),
@@ -721,6 +769,7 @@ async def main() -> None:
         bot_client.loop.create_task(github_watcher())
 
     logger.info("Forwarder started for channels=%s", CHANNELS)
+    asyncio.create_task(heartbeat_monitor())
 
     if bot_client:
         await asyncio.gather(
