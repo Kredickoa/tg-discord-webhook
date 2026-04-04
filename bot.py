@@ -13,6 +13,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -45,6 +46,8 @@ HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("HEARTBEAT_INTERVAL_SECONDS", "3
 CHANNELS = ["ab3army", "ab3brigade"]
 CHANNEL_USERNAMES = {channel.lower() for channel in CHANNELS}
 CHANNEL_IDS: set[int] = set()
+CHANNEL_USERNAMES_BY_ID: dict[int, str] = {}
+CHANNEL_TITLES_BY_ID: dict[int, str] = {}
 
 EMBED_COLOR = 0xFF6600
 DISCORD_MAX_BYTES = 100 * 1024 * 1024
@@ -235,16 +238,44 @@ def _is_duplicate_signature(signature: str, message_id: int | None, grouped_id: 
     return False
 
 
-def _is_target_chat(chat) -> bool:
-    username = getattr(chat, "username", None)
+def _is_target_chat(chat=None, chat_id: int | None = None, username: str | None = None) -> bool:
+    if chat is not None:
+        username = username or getattr(chat, "username", None)
+        chat_id = chat_id if chat_id is not None else getattr(chat, "id", None)
+
     if username and username.lower() in CHANNEL_USERNAMES:
         return True
 
-    chat_id = getattr(chat, "id", None)
     if isinstance(chat_id, int) and chat_id in CHANNEL_IDS:
         return True
 
     return False
+
+
+async def _resolve_event_chat(event) -> Any:
+    chat_id = getattr(event, "chat_id", None)
+    chat = getattr(event, "chat", None)
+    if chat is not None:
+        return chat
+
+    try:
+        chat = await event.get_chat()
+    except Exception as exc:
+        logger.warning("event_chat_resolve_failed chat_id=%s error=%s", chat_id, exc)
+        chat = None
+
+    if chat is not None:
+        return chat
+
+    fallback_username = CHANNEL_USERNAMES_BY_ID.get(chat_id)
+    fallback_title = CHANNEL_TITLES_BY_ID.get(chat_id) or fallback_username or f"chat:{chat_id}"
+    logger.info(
+        "event_chat_fallback_used chat_id=%s username=%s title=%s",
+        chat_id,
+        fallback_username,
+        fallback_title,
+    )
+    return SimpleNamespace(id=chat_id, username=fallback_username, title=fallback_title)
 
 
 async def _add_stat(channel_title: str, msg_type: str) -> None:
@@ -712,36 +743,44 @@ async def heartbeat_monitor() -> None:
 
 @client.on(events.Album())
 async def on_channel_album(event: events.Album.Event) -> None:
-    if not _is_target_chat(event.chat):
+    chat_id = getattr(event, "chat_id", None)
+    chat = getattr(event, "chat", None)
+    username = getattr(chat, "username", None)
+    if not _is_target_chat(chat=chat, chat_id=chat_id, username=username):
         return
     if not event.messages:
         return
+    chat = await _resolve_event_chat(event)
     _mark_activity("last_target_event_at")
     logger.info(
         "target_album_received chat_id=%s username=%s items=%s grouped_id=%s",
-        getattr(event.chat, "id", None),
-        getattr(event.chat, "username", None),
+        getattr(chat, "id", None),
+        getattr(chat, "username", None),
         len(event.messages),
         getattr(event.messages[0], "grouped_id", None),
     )
-    await _process_target_messages(event.chat, list(event.messages), "album")
+    await _process_target_messages(chat, list(event.messages), "album")
 
 
 @client.on(events.NewMessage())
 async def on_channel_post(event: events.NewMessage.Event) -> None:
-    if not _is_target_chat(event.chat):
+    chat_id = getattr(event, "chat_id", None)
+    chat = getattr(event, "chat", None)
+    username = getattr(chat, "username", None)
+    if not _is_target_chat(chat=chat, chat_id=chat_id, username=username):
         return
+    chat = await _resolve_event_chat(event)
     if getattr(event.message, "grouped_id", None) is not None:
         _mark_activity("last_target_event_at")
         logger.info(
             "grouped_message_buffered chat_id=%s username=%s message_id=%s grouped_id=%s",
-            getattr(event.chat, "id", None),
-            getattr(event.chat, "username", None),
+            getattr(chat, "id", None),
+            getattr(chat, "username", None),
             getattr(event.message, "id", None),
             getattr(event.message, "grouped_id", None),
         )
         return
-    await _process_target_messages(event.chat, [event.message], "new_message")
+    await _process_target_messages(chat, [event.message], "new_message")
 
 
 async def main() -> None:
@@ -749,12 +788,17 @@ async def main() -> None:
     await client.start()
 
     CHANNEL_IDS.clear()
+    CHANNEL_USERNAMES_BY_ID.clear()
+    CHANNEL_TITLES_BY_ID.clear()
     for channel_name in CHANNELS:
         try:
             entity = await client.get_entity(channel_name)
             entity_id = getattr(entity, "id", None)
             if isinstance(entity_id, int):
                 CHANNEL_IDS.add(entity_id)
+                CHANNEL_USERNAMES_BY_ID[entity_id] = channel_name.lower()
+                if getattr(entity, "title", None):
+                    CHANNEL_TITLES_BY_ID[entity_id] = getattr(entity, "title", None)
             logger.info(
                 "Resolved channel target: username=%s id=%s title=%s",
                 channel_name,
