@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 import motor.motor_asyncio
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 from telethon.tl.custom import Button
 from telethon.tl.types import (
@@ -152,6 +152,16 @@ def _age_seconds(moment: float | None) -> str:
     return str(int(time.monotonic() - moment))
 
 
+def _normalize_chat_id(chat_id: int | None) -> int | None:
+    if not isinstance(chat_id, int):
+        return None
+    try:
+        resolved_id, _ = utils.resolve_id(chat_id)
+        return resolved_id
+    except Exception:
+        return abs(chat_id)
+
+
 def _github_commit_api_url() -> str:
     return f"https://api.github.com/repos/{GITHUB_REPO}/commits"
 
@@ -242,11 +252,12 @@ def _is_target_chat(chat=None, chat_id: int | None = None, username: str | None 
     if chat is not None:
         username = username or getattr(chat, "username", None)
         chat_id = chat_id if chat_id is not None else getattr(chat, "id", None)
+    normalized_chat_id = _normalize_chat_id(chat_id)
 
     if username and username.lower() in CHANNEL_USERNAMES:
         return True
 
-    if isinstance(chat_id, int) and chat_id in CHANNEL_IDS:
+    if isinstance(normalized_chat_id, int) and normalized_chat_id in CHANNEL_IDS:
         return True
 
     return False
@@ -254,6 +265,7 @@ def _is_target_chat(chat=None, chat_id: int | None = None, username: str | None 
 
 async def _resolve_event_chat(event) -> Any:
     chat_id = getattr(event, "chat_id", None)
+    normalized_chat_id = _normalize_chat_id(chat_id)
     chat = getattr(event, "chat", None)
     if chat is not None:
         return chat
@@ -261,21 +273,22 @@ async def _resolve_event_chat(event) -> Any:
     try:
         chat = await event.get_chat()
     except Exception as exc:
-        logger.warning("event_chat_resolve_failed chat_id=%s error=%s", chat_id, exc)
+        logger.warning("event_chat_resolve_failed chat_id=%s normalized_chat_id=%s error=%s", chat_id, normalized_chat_id, exc)
         chat = None
 
     if chat is not None:
         return chat
 
-    fallback_username = CHANNEL_USERNAMES_BY_ID.get(chat_id)
-    fallback_title = CHANNEL_TITLES_BY_ID.get(chat_id) or fallback_username or f"chat:{chat_id}"
+    fallback_username = CHANNEL_USERNAMES_BY_ID.get(normalized_chat_id)
+    fallback_title = CHANNEL_TITLES_BY_ID.get(normalized_chat_id) or fallback_username or f"chat:{normalized_chat_id or chat_id}"
     logger.info(
-        "event_chat_fallback_used chat_id=%s username=%s title=%s",
+        "event_chat_fallback_used chat_id=%s normalized_chat_id=%s username=%s title=%s",
         chat_id,
+        normalized_chat_id,
         fallback_username,
         fallback_title,
     )
-    return SimpleNamespace(id=chat_id, username=fallback_username, title=fallback_title)
+    return SimpleNamespace(id=normalized_chat_id or chat_id, username=fallback_username, title=fallback_title)
 
 
 async def _add_stat(channel_title: str, msg_type: str) -> None:
